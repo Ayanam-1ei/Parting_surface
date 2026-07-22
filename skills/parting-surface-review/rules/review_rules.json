@@ -1,0 +1,115 @@
+﻿{
+  "rules": [
+    {
+      "id": "PL-001",
+      "name": "分型面平直度",
+      "description": "分型面应为平面；复杂曲面需有充分理由",
+      "field": "parting_line.flatness_score",
+      "operator": ">=",
+      "threshold": 8,
+      "severity": "WARN",
+      "consequence": "加工困难，配模精度差",
+      "category": "parting_line"
+    },
+    {
+      "id": "PL-002",
+      "name": "分型面位置",
+      "description": "分型面必须位于产品最大轮廓处",
+      "field": "parting_line.is_at_max_contour",
+      "operator": "==",
+      "threshold": true,
+      "severity": "ERROR",
+      "consequence": "产生倒扣，拉伤产品，或形成尖钢",
+      "category": "parting_line"
+    },
+    {
+      "id": "SS-001",
+      "name": "尖钢最小壁厚",
+      "description": "分型面边缘钢料最小壁厚须 >= 2.0mm",
+      "field": "sharp_steels[*].thickness_mm",
+      "operator": ">=",
+      "threshold": 2.0,
+      "severity": "ERROR",
+      "consequence": "崩裂，模具寿命急剧下降",
+      "category": "sharp_steel",
+      "per_item": true
+    },
+    {
+      "id": "SS-002",
+      "name": "钢料细长比",
+      "description": "钢料高度/厚度比须 <= 3:1",
+      "field": "sharp_steels[*].aspect_ratio",
+      "operator": "<=",
+      "threshold": 3.0,
+      "severity": "ERROR",
+      "consequence": "强度不足，受压变形",
+      "category": "sharp_steel",
+      "per_item": true
+    },
+    {
+      "id": "SS-003",
+      "name": "尖钢边缘R角",
+      "description": "不得有尖锐内角（R < 0.5mm）",
+      "field": "sharp_steels[*].edge_radius_mm",
+      "operator": ">=",
+      "threshold": 0.5,
+      "severity": "WARN",
+      "consequence": "应力集中，易崩缺",
+      "category": "sharp_steel",
+      "per_item": true
+    },
+    {
+      "id": "UC-001",
+      "name": "倒扣检测",
+      "description": "分型面下方不得有倒扣阻碍开模",
+      "field": "undercuts",
+      "operator": "length_zero",
+      "threshold": 0,
+      "severity": "ERROR",
+      "consequence": "无法正常脱模",
+      "category": "undercut"
+    }
+  ],
+  "material_wear_factors": {
+    "ABS": 1.0,
+    "PC": 1.2,
+    "POM": 1.5,
+    "PA": 2.0,
+    "PA+GF": 3.5,
+    "PA6+GF30": 3.5,
+    "PA66+GF30": 4.0,
+    "PP": 1.0,
+    "PP+GF": 3.0,
+    "PP+GF30": 3.5,
+    "PBT+GF30": 3.5,
+    "PPS+GF40": 5.0,
+    "PEEK+GF30": 4.0,
+    "PEI": 2.0,
+    "PMMA": 1.0,
+    "LCP": 1.5,
+    "DEFAULT": 1.0
+  },
+  "solution_priority": [
+    {
+      "rank": 1,
+      "name": "移分型面",
+      "description": "调整分型面位置到更合理的高度",
+      "cost_impact": "零额外机构成本",
+      "applicable_when": "产品允许分型面移动"
+    },
+    {
+      "rank": 2,
+      "name": "局部避空+镶件",
+      "description": "在尖钢区域挖镶件槽，制作独立镶件",
+      "cost_impact": "镶件加工费 + 装配工时",
+      "applicable_when": "分型面不可移动"
+    },
+    {
+      "rank": 3,
+      "name": "加侧抽芯",
+      "description": "添加侧向抽芯机构（滑块/斜顶）",
+      "cost_impact": "模具整体成本 ↑20~35%",
+      "applicable_when": "产品几何复杂，前两者不适用"
+    }
+  ]
+}
