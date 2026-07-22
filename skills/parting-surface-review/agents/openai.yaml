@@ -1,0 +1,4 @@
+interface:
+  display_name: "分型面尖钢审查"
+  short_description: "本地解析 NX PRT，量测尖钢风险并自动复查"
+  default_prompt: "Use $parting-surface-review to review this NX .prt for parting-surface sharp-steel risks without changing the source file."

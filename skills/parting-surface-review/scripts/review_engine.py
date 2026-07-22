@@ -1,818 +1,674 @@
 # -*- coding: utf-8 -*-
-"""
-=============================================================================
-分型面尖钢审查引擎 (Review Engine)
-=============================================================================
-用途：接收 NX Journal 提取的 JSON 数据，执行规则审查、工程推理、生成修改方案
-运行：python review_engine.py <input.json>
-      或在代码中 import review_engine
-=============================================================================
-"""
+from __future__ import annotations
 
+import argparse
+import copy
 import json
-import sys
-import os
-from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass, field, asdict
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
-# ============================================================================
-# 数据结构
-# ============================================================================
-
-@dataclass
-class ReviewResult:
-    """单条规则的审查结果"""
-    rule_id: str
-    rule_name: str
-    severity: str          # ERROR / WARN
-    passed: bool
-    actual_value: Any
-    threshold: Any
-    detail: str
-    affected_items: List[str] = field(default_factory=list)
+REVIEW_SCHEMA_VERSION = "2.0"
+STATUS_LABELS = {
+    "passed": "通过",
+    "conditional": "有条件通过，需工程确认",
+    "not_passed": "不通过，存在确认几何风险",
+    "stopped_incomplete": "达到最大轮次，仍未闭环",
+}
 
 
-@dataclass
-class Issue:
-    """发现的问题"""
-    issue_id: str
-    title: str
-    severity: str
-    rule_ids: List[str]
-    position: str
-    coordinates: Dict[str, float]
-    current_values: Dict[str, Any]
-    required_values: Dict[str, Any]
-    category: str          # sharp_steel / parting_line / undercut
+class ReviewEngineError(RuntimeError):
+    pass
 
-
-@dataclass
-class Solution:
-    """修改方案"""
-    solution_id: str
-    issue_id: str
-    solution_type: str     # A / B
-    priority: str          # 推荐 / 备选
-    description: str
-    parameters: Dict[str, Any]
-    nx_operations: List[str]
-    verification: Dict[str, Any]
-    cost_impact: str
-
-
-@dataclass
-class ReviewTracker:
-    """审查状态追踪器"""
-    current_round: int
-    max_rounds: int
-    overall_status: str    # 通过 / 不通过
-    errors_this_round: int
-    warns_this_round: int
-    closed_issues: List[str]
-    remaining_issues: List[str]
-    pending_actions: List[str]
-    terminated: bool = False
-    terminate_reason: str = ""
-
-
-# ============================================================================
-# 规则引擎
-# ============================================================================
 
 class ReviewEngine:
-    """分型面尖钢审查引擎"""
-
-    def __init__(self, rules_path: Optional[str] = None):
-        """初始化引擎，加载规则"""
-        if rules_path:
-            self.rules = self._load_rules(rules_path)
-        else:
-            self.rules = self._default_rules()
-
-        self.material_factors = {
-            "ABS": 1.0, "PC": 1.2, "POM": 1.5,
-            "PA": 2.0, "PA+GF": 3.5, "PA6+GF30": 3.5,
-            "PA66+GF30": 4.0, "PP": 1.0, "PP+GF": 3.0,
-            "PP+GF30": 3.5, "PBT+GF30": 3.5, "PPS+GF40": 5.0,
-            "PEEK+GF30": 4.0, "PEI": 2.0, "PMMA": 1.0,
-            "LCP": 1.5, "DEFAULT": 1.0
+    def __init__(self, rules_path: Optional[Path] = None) -> None:
+        if rules_path is None:
+            rules_path = Path(__file__).resolve().parents[1] / "rules" / "review_rules.json"
+        try:
+            self.rules_document = json.loads(rules_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            raise ReviewEngineError("无法读取审查规则: " + str(error))
+        self.rules = {
+            rule["id"]: rule for rule in self.rules_document.get("rules", []) if "id" in rule
         }
+        self.policy = self.rules_document.get("sharp_steel_candidate_policy", {})
 
-    def _load_rules(self, path: str) -> List[Dict]:
-        """从 JSON 文件加载规则"""
-        with open(path, 'r', encoding='utf-8-sig') as f:
-            config = json.load(f)
-        return config.get("rules", [])
+    def review(
+        self,
+        evidence: Dict,
+        previous_review: Optional[Dict] = None,
+        round_number: int = 1,
+        max_rounds: int = 5,
+    ) -> Dict:
+        self._validate_evidence(evidence)
+        if round_number < 1 or max_rounds < 1:
+            raise ReviewEngineError("round_number 和 max_rounds 必须大于 0")
 
-    def _default_rules(self) -> List[Dict]:
-        """默认审查规则"""
-        return [
-            {
-                "id": "PL-001", "name": "分型面平直度",
-                "field": "parting_line.flatness_score",
-                "operator": ">=", "threshold": 8,
-                "severity": "WARN", "category": "parting_line",
-                "consequence": "加工困难，配模精度差"
+        rule_results = self._evaluate_rules(evidence)
+        issues = self._build_geometry_issues(evidence)
+        issues, change_tracking = self._track_changes(
+            issues, previous_review, evidence["meta"]["source_sha256"]
+        )
+        counts = self._build_counts(rule_results, issues)
+        status = self._determine_status(counts)
+        if round_number >= max_rounds and status != "passed":
+            status = "stopped_incomplete"
+
+        source = evidence["meta"]
+        review_id = "REV-{0}-{1:02d}".format(
+            datetime.now().strftime("%Y%m%d%H%M%S"), round_number
+        )
+        result = {
+            "schema_version": REVIEW_SCHEMA_VERSION,
+            "review_id": review_id,
+            "review_time_utc": datetime.now(timezone.utc).isoformat(),
+            "round_number": round_number,
+            "max_rounds": max_rounds,
+            "status": status,
+            "conclusion": STATUS_LABELS[status],
+            "source": {
+                "file_name": source.get("file_name"),
+                "full_path": source.get("full_path"),
+                "source_sha256": source.get("source_sha256"),
+                "analysis_mode": source.get("analysis_mode"),
+                "source_modified_by_workflow": False,
             },
-            {
-                "id": "PL-002", "name": "分型面位置",
-                "field": "parting_line.is_at_max_contour",
-                "operator": "==", "threshold": True,
-                "severity": "ERROR", "category": "parting_line",
-                "consequence": "产生倒扣，拉伤产品，或形成尖钢"
+            "geometry_summary": {
+                "body_count": len(evidence.get("bodies", [])),
+                "parting_surface": evidence.get("parting_surface", {}),
+                "sharp_steel_summary": evidence.get("sharp_steel_summary", {}),
             },
-            {
-                "id": "SS-001", "name": "尖钢最小壁厚",
-                "field": "sharp_steels[*].thickness_mm",
-                "operator": ">=", "threshold": 2.0,
-                "severity": "ERROR", "category": "sharp_steel",
-                "consequence": "崩裂，模具寿命急剧下降",
-                "per_item": True
-            },
-            {
-                "id": "SS-002", "name": "钢料细长比",
-                "field": "sharp_steels[*].aspect_ratio",
-                "operator": "<=", "threshold": 3.0,
-                "severity": "ERROR", "category": "sharp_steel",
-                "consequence": "强度不足，受压变形",
-                "per_item": True
-            },
-            {
-                "id": "SS-003", "name": "尖钢边缘R角",
-                "field": "sharp_steels[*].edge_radius_mm",
-                "operator": ">=", "threshold": 0.5,
-                "severity": "WARN", "category": "sharp_steel",
-                "consequence": "应力集中，易崩缺",
-                "per_item": True
-            },
-            {
-                "id": "UC-001", "name": "倒扣检测",
-                "field": "undercuts",
-                "operator": "length_zero", "threshold": 0,
-                "severity": "ERROR", "category": "undercut",
-                "consequence": "无法正常脱模"
-            }
+            "rule_results": rule_results,
+            "issues": issues,
+            "unavailable_checks": [
+                item for item in rule_results if item["status"] == "UNAVAILABLE"
+            ],
+            "change_tracking": change_tracking,
+            "counts": counts,
+            "repair_plan": self._build_repair_plan(issues),
+            "next_action": self._build_next_action(status, round_number, max_rounds),
+            "limitations": evidence.get("limitations", []),
+        }
+        return result
+
+    def render_markdown(self, review: Dict) -> str:
+        lines = [
+            "# 分型面尖钢审查报告",
+            "",
+            "- Review ID：`{}`".format(review["review_id"]),
+            "- 审查轮次：{} / {}".format(review["round_number"], review["max_rounds"]),
+            "- 总体结论：**{}**".format(review["conclusion"]),
+            "- 源文件哈希：`{}`".format(review["source"].get("source_sha256") or "unavailable"),
+            "- 源文件状态：未被工作流修改",
+            "",
+            "## 确定性几何摘要",
+            "",
         ]
-
-    # ========================================================================
-    # 核心审查流程
-    # ========================================================================
-
-    def review(self, data: Dict, previous_data: Optional[Dict] = None,
-               round_num: int = 1, max_rounds: int = 5) -> Dict:
-        """
-        执行完整审查流程
-
-        Args:
-            data: NX Journal 提取的 JSON 数据
-            previous_data: 上一轮的数据（用于对比）
-            round_num: 当前轮次
-            max_rounds: 最大轮次
-
-        Returns:
-            包含所有审查结果的字典
-        """
-        # Step 1: 规则审查
-        rule_results = self._run_rules(data)
-        errors = [r for r in rule_results if r.severity == "ERROR" and not r.passed]
-        warns = [r for r in rule_results if r.severity == "WARN" and not r.passed]
-
-        # Step 2: 工程推理
-        engineering_notes = self._engineering_reasoning(data, rule_results)
-
-        # Step 3: 问题清单与修改方案
-        issues = self._build_issues(data, errors + warns)
-        solutions = self._generate_solutions(issues, data)
-
-        # Step 4: 追踪器
-        overall_status = "通过" if (len(errors) == 0 and len(warns) <= 1) else "不通过"
-        tracker = ReviewTracker(
-            current_round=round_num,
-            max_rounds=max_rounds,
-            overall_status=overall_status,
-            errors_this_round=len(errors),
-            warns_this_round=len(warns),
-            closed_issues=self._find_closed(previous_data, data, issues) if previous_data else [],
-            remaining_issues=[i.issue_id for i in issues],
-            pending_actions=self._build_pending_actions(issues, solutions)
+        summary = review["geometry_summary"]["sharp_steel_summary"]
+        lines.extend(
+            [
+                "- 原始候选：{}".format(summary.get("raw_candidate_count", 0)),
+                "- 聚类候选：{}".format(summary.get("clustered_candidate_count", 0)),
+                "- 确认几何风险：{}".format(
+                    summary.get("confirmed_geometry_risk_count", 0)
+                ),
+                "- 报告候选：{}，省略：{}".format(
+                    summary.get("reported_candidate_count", 0),
+                    summary.get("omitted_candidate_count", 0),
+                ),
+                "",
+                "> 边长与曲线最小半径只用于拓扑筛查，不等同于钢厚或真实钢料圆角。",
+                "",
+                "## 规则审查",
+                "",
+                "| 规则 | 状态 | 量测/依据 | 结论 |",
+                "|---|---|---|---|",
+            ]
         )
-
-        # 检查是否强制终止
-        if round_num >= max_rounds and overall_status != "通过":
-            tracker.terminated = True
-            tracker.terminate_reason = "达到最大轮次 {} 轮".format(max_rounds)
-
-        # 组装输出
-        return {
-            "rule_results": [asdict(r) for r in rule_results],
-            "engineering_notes": engineering_notes,
-            "issues": [asdict(i) for i in issues],
-            "solutions": [asdict(s) for s in solutions],
-            "tracker": asdict(tracker),
-            "is_pass": overall_status == "通过"
-        }
-
-    # ========================================================================
-    # Step 1: 规则引擎
-    # ========================================================================
-
-    def _run_rules(self, data: Dict) -> List[ReviewResult]:
-        """运行所有审查规则"""
-        results = []
-
-        for rule in self.rules:
-            rule_id = rule["id"]
-            is_per_item = rule.get("per_item", False)
-
-            if is_per_item:
-                item_results = self._check_per_item_rule(data, rule)
-                results.extend(item_results)
-            else:
-                result = self._check_single_rule(data, rule)
-                results.append(result)
-
-        return results
-
-    def _check_single_rule(self, data: Dict, rule: Dict) -> ReviewResult:
-        """检查单条规则"""
-        field_path = rule["field"]
-        operator = rule["operator"]
-        threshold = rule["threshold"]
-
-        # 提取字段值
-        value = self._get_field(data, field_path)
-
-        # 执行比较
-        passed = self._compare(value, operator, threshold)
-
-        detail = self._build_detail(rule, value, passed)
-        return ReviewResult(
-            rule_id=rule["id"],
-            rule_name=rule["name"],
-            severity=rule["severity"],
-            passed=passed,
-            actual_value=value,
-            threshold=threshold,
-            detail=detail
-        )
-
-    def _check_per_item_rule(self, data: Dict, rule: Dict) -> List[ReviewResult]:
-        """检查数组中的逐项规则"""
-        field_path = rule["field"]
-        operator = rule["operator"]
-        threshold = rule["threshold"]
-        results = []
-
-        # 解析路径：sharp_steels[*].thickness_mm
-        array_path = field_path.split("[*]")[0]
-        item_field = field_path.split("[*].")[1] if "[*]." in field_path else field_path.split("[*]")[1].lstrip(".")
-
-        items = self._get_field(data, array_path) or []
-
-        for item in items:
-            value = item.get(item_field, None)
-            item_id = item.get("id", "UNKNOWN")
-            passed = self._compare(value, operator, threshold)
-            detail = "{}: {} = {} (阈值: {} {})".format(
-                item_id, item_field, value,
-                self._op_symbol(operator), threshold
+        for item in review["rule_results"]:
+            lines.append(
+                "| {} {} | {} | {} | {} |".format(
+                    item["rule_id"],
+                    _markdown_cell(item["name"]),
+                    item["status"],
+                    _markdown_cell(item["evidence"]),
+                    _markdown_cell(item["message"]),
+                )
             )
 
-            results.append(ReviewResult(
-                rule_id=rule["id"],
-                rule_name=rule["name"],
-                severity=rule["severity"],
-                passed=passed,
-                actual_value=value,
-                threshold=threshold,
-                detail=detail,
-                affected_items=[item_id]
-            ))
+        lines.extend(["", "## 问题与建议", ""])
+        if not review["issues"]:
+            lines.append("未发现达到当前确定性门槛的尖钢几何候选。")
+        for issue in review["issues"]:
+            coordinate = issue["coordinate_approx"]
+            lines.extend(
+                [
+                    "### {} [{}] {}".format(
+                        issue["issue_id"], issue["severity"], issue["title"]
+                    ),
+                    "",
+                    "- 坐标：X={:.3f}, Y={:.3f}, Z={:.3f} mm".format(
+                        coordinate["x"], coordinate["y"], coordinate["z"]
+                    ),
+                    "- 几何量测：边长 {:.6f} mm，面夹角 {:.3f}°，窄面最小包围盒尺寸 {:.6f} mm".format(
+                        issue["measurements"]["representative_edge_length_mm"],
+                        issue["measurements"]["wedge_angle_deg"],
+                        issue["measurements"]["min_narrow_face_dimension_mm"],
+                    ),
+                    "- 产品距离：{} mm".format(
+                        _number(issue["measurements"].get("distance_to_product_mm"), 6)
+                    ),
+                    "- 工程判断：{}".format(issue["engineering_assessment"]),
+                    "- 方案 A：{}".format(issue["recommendations"][0]["instruction"]),
+                    "- 方案 B：{}".format(issue["recommendations"][1]["instruction"]),
+                    "- 验证标准：{}".format("；".join(issue["verification_criteria"])),
+                    "",
+                ]
+            )
 
-        # 如果没有找到任何项，视为通过
-        if not items:
-            results.append(ReviewResult(
-                rule_id=rule["id"],
-                rule_name=rule["name"],
-                severity=rule["severity"],
-                passed=True,
-                actual_value="无检测项",
-                threshold=threshold,
-                detail="未找到可检测的尖钢特征"
-            ))
+        lines.extend(["## Loop 追踪", ""])
+        tracking = review["change_tracking"]
+        lines.extend(
+            [
+                "- 新增：{}".format(_join_ids(tracking["new_issue_ids"])),
+                "- 改善：{}".format(_join_ids(tracking["improved_issue_ids"])),
+                "- 未关闭：{}".format(_join_ids(tracking["remaining_issue_ids"])),
+                "- 已关闭：{}".format(_join_ids(tracking["closed_issue_ids"])),
+                "- 几何是否变化：{}".format(
+                    "否" if tracking.get("same_source_hash") else "是或首轮"
+                ),
+                "",
+                "## 数据边界",
+                "",
+            ]
+        )
+        unavailable = review["unavailable_checks"]
+        if unavailable:
+            for item in unavailable:
+                lines.append("- {}：{}".format(item["rule_id"], item["message"]))
+        else:
+            lines.append("- 本轮规则所需量测均可用。")
+        for limitation in review.get("limitations", []):
+            lines.append("- {}".format(limitation))
 
-        return results
+        lines.extend(
+            [
+                "",
+                "## 下一步",
+                "",
+                review["next_action"]["message"],
+                "",
+            ]
+        )
+        return "\n".join(lines)
 
-    def _get_field(self, data: Dict, path: str) -> Any:
-        """从嵌套字典中按路径获取字段值"""
-        keys = path.split(".")
-        value = data
-        for key in keys:
-            if key.endswith("[*]"):
-                key = key[:-3]
-            if isinstance(value, dict):
-                value = value.get(key)
-            else:
-                return None
-            if value is None:
-                return None
-        return value
+    def _validate_evidence(self, evidence: Dict) -> None:
+        if evidence.get("schema_version") != "2.0":
+            raise ReviewEngineError("仅支持 geometry evidence schema_version 2.0")
+        metadata = evidence.get("meta")
+        if not isinstance(metadata, dict) or not metadata.get("source_sha256"):
+            raise ReviewEngineError("几何证据缺少源文件 SHA-256")
 
-    def _compare(self, value: Any, operator: str, threshold: Any) -> bool:
-        """执行比较操作"""
-        if value is None:
-            return False
+    def _evaluate_rules(self, evidence: Dict) -> List[Dict]:
+        return [
+            self._parting_surface_complexity(evidence),
+            self._maximum_contour(evidence),
+            self._geometry_risk_rule(evidence),
+            self._numeric_per_item_rule(evidence, "SS-001", "thickness_mm"),
+            self._numeric_per_item_rule(evidence, "SS-002", "aspect_ratio"),
+            self._numeric_per_item_rule(evidence, "SS-003", "edge_radius_mm"),
+            self._undercut_rule(evidence),
+        ]
 
-        if operator == ">=":
-            return value >= threshold
-        elif operator == "<=":
-            return value <= threshold
-        elif operator == "==":
-            return value == threshold
-        elif operator == "!=":
-            return value != threshold
-        elif operator == ">":
-            return value > threshold
-        elif operator == "<":
-            return value < threshold
-        elif operator == "length_zero":
-            return len(value) == 0 if isinstance(value, (list, str)) else False
-        return False
-
-    def _op_symbol(self, operator: str) -> str:
-        """操作符显示符号"""
-        symbols = {
-            ">=": "≥", "<=": "≤", "==": "=",
-            "!=": "≠", ">": ">", "<": "<",
-            "length_zero": "空"
-        }
-        return symbols.get(operator, operator)
-
-    def _build_detail(self, rule: Dict, value: Any, passed: bool) -> str:
-        """构建审查结果描述"""
-        status = "✅" if passed else ("❌" if rule["severity"] == "ERROR" else "⚠️")
-        op = self._op_symbol(rule["operator"])
-        return "{} {}: 实际值={} {} 阈值={} → {}".format(
-            status, rule["name"], value, op, rule["threshold"],
-            "通过" if passed else rule.get("consequence", "不通过")
+    def _parting_surface_complexity(self, evidence: Dict) -> Dict:
+        rule = self._rule("PL-001", "分型面复杂度")
+        surface = evidence.get("parting_surface", {})
+        if surface.get("measurement_status") == "unavailable":
+            return self._result(rule, "UNAVAILABLE", "未识别到独立分型面 Sheet Body", "无法审查")
+        flatness = surface.get("flatness_score")
+        if surface.get("is_planar"):
+            return self._result(rule, "PASS", "全部分型面均为平面", "满足平面规则")
+        return self._result(
+            rule,
+            "WARN",
+            "平面占比评分 {}/10，面数 {}".format(_number(flatness, 1), surface.get("face_count")),
+            "分型面为复杂曲面，需确认必要性、加工与配模风险",
         )
 
-    # ========================================================================
-    # Step 2: 工程推理
-    # ========================================================================
+    def _maximum_contour(self, evidence: Dict) -> Dict:
+        rule = self._rule("PL-002", "最大轮廓分型位置")
+        value = evidence.get("parting_line", {}).get("is_at_max_contour")
+        if value is None:
+            return self._result(
+                rule,
+                "UNAVAILABLE",
+                "缺少开模方向与可见性分析",
+                "不得推断分型面位于最大轮廓",
+            )
+        if value:
+            return self._result(rule, "PASS", "is_at_max_contour=true", "满足规则")
+        return self._result(
+            rule, "ERROR", "is_at_max_contour=false", "存在倒扣或尖钢形成风险"
+        )
 
-    def _engineering_reasoning(self, data: Dict,
-                                rule_results: List[ReviewResult]) -> List[Dict]:
-        """工程推理：基于规则结果和工艺经验进行软判断"""
-        notes = []
-        material = data.get("product", {}).get("material", "UNKNOWN")
-        wear_factor = self.material_factors.get(material, 1.0)
+    def _geometry_risk_rule(self, evidence: Dict) -> Dict:
+        rule = self._rule("SS-GEO-001", "尖钢几何候选")
+        summary = evidence.get("sharp_steel_summary", {})
+        confirmed = int(summary.get("confirmed_geometry_risk_count", 0))
+        candidates = int(summary.get("candidate_count", 0))
+        detail = "确认风险 {}，待确认候选 {}".format(confirmed, candidates)
+        if confirmed:
+            return self._result(rule, "ERROR", detail, "存在满足三重几何门槛的尖钢风险")
+        if candidates:
+            return self._result(rule, "WARN", detail, "需由模具工程师确认局部钢料关系")
+        return self._result(rule, "PASS", detail, "未命中当前尖钢候选门槛")
 
-        # 1. 高压区尖钢分析
-        sharp_steels = data.get("sharp_steels", [])
-        high_pressure_ss = [s for s in sharp_steels if s.get("is_in_high_pressure_zone")]
-        if high_pressure_ss:
-            notes.append({
-                "type": "高压区尖钢",
-                "severity": "WARN",
-                "detail": "检测到 {} 处尖钢位于高压区（浇口附近/填充末端），{} 注塑压力下风险显著增加".format(
-                    len(high_pressure_ss), material
-                ),
-                "recommendation": "高压区尖钢建议最小壁厚提升至 2.5mm，长径比 ≤ 2:1"
-            })
+    def _numeric_per_item_rule(self, evidence: Dict, rule_id: str, field: str) -> Dict:
+        rule = self._rule(rule_id, rule_id)
+        values = [
+            item.get(field)
+            for item in evidence.get("sharp_steels", [])
+            if item.get(field) is not None
+        ]
+        if not values:
+            return self._result(
+                rule,
+                "UNAVAILABLE",
+                "{} 无可信量测".format(field),
+                "缺少独立型腔/型芯钢料实体，不得以边长代替",
+            )
+        operator = rule.get("operator")
+        threshold = rule.get("threshold")
+        failures = [value for value in values if not _compare(value, operator, threshold)]
+        if not failures:
+            return self._result(
+                rule,
+                "PASS",
+                "{} 个量测均满足阈值 {}".format(len(values), threshold),
+                "满足规则",
+            )
+        status = "ERROR" if rule.get("severity") == "ERROR" else "WARN"
+        return self._result(
+            rule,
+            status,
+            "{} 个不合格，最不利值 {}".format(len(failures), _worst(failures, operator)),
+            rule.get("consequence", "不满足规则"),
+        )
 
-        # 2. 材料敏感度分析
-        if wear_factor >= 3.0:
-            notes.append({
-                "type": "玻纤材料磨损风险",
-                "severity": "WARN",
-                "detail": "材料 {} 含玻纤增强，磨损系数 {:.1f}x，尖钢磨损速度比 ABS 快 {:.0f}~{:.0f} 倍".format(
-                    material, wear_factor, wear_factor, wear_factor * 1.5
-                ),
-                "recommendation": "建议尖钢区域使用 H13 (HRC 48~52) 或 SKD61 镶件，表面氮化处理"
-            })
+    def _undercut_rule(self, evidence: Dict) -> Dict:
+        rule = self._rule("UC-001", "倒扣检测")
+        analysis = evidence.get("undercut_analysis", {})
+        if analysis.get("status") == "unavailable":
+            return self._result(
+                rule,
+                "UNAVAILABLE",
+                analysis.get("reason", "缺少开模方向"),
+                "不得声明无倒扣",
+            )
+        undercuts = evidence.get("undercuts", [])
+        if undercuts:
+            return self._result(rule, "ERROR", "{} 个倒扣".format(len(undercuts)), "阻碍脱模")
+        return self._result(rule, "PASS", "0 个倒扣", "满足规则")
 
-        # 3. 分型面复杂度成本分析
-        pl = data.get("parting_line", {})
-        flatness = pl.get("flatness_score", 10)
-        shape_type = pl.get("shape_type", "flat")
-        if flatness < 6:
-            multiplier = 2.0 if shape_type == "wavy" else 3.0
-            notes.append({
-                "type": "分型面加工成本",
-                "severity": "INFO",
-                "detail": "分型面类型为 {} (平直度 {}/10)，加工费约为平面的 {:.0f} 倍".format(
-                    shape_type, flatness, multiplier
-                ),
-                "recommendation": "评估是否可以通过调整产品结构简化分型面"
-            })
-
-        # 4. 模具寿命预估修正
-        base_life = data.get("mold", {}).get("expected_shot_life_k", 10) * 1000
-        ss_issues = [r for r in rule_results if r.rule_id.startswith("SS-") and not r.passed]
-        if ss_issues:
-            life_reduction = len(ss_issues) * 0.3
-            adjusted_life = base_life * (1 - life_reduction) / 1000
-            notes.append({
-                "type": "模具寿命预估",
-                "severity": "WARN" if life_reduction > 0.3 else "INFO",
-                "detail": "存在 {} 个尖钢问题，预估模具寿命降至 {:.1f}K 模次（原 {:.0f}K）".format(
-                    len(ss_issues), adjusted_life, base_life / 1000
-                ),
-                "recommendation": "修复所有尖钢问题后，寿命可恢复至原始预估的 90% 以上"
-            })
-
-        return notes
-
-    # ========================================================================
-    # Step 3: 问题清单与修改方案
-    # ========================================================================
-
-    def _build_issues(self, data: Dict,
-                       failed_rules: List[ReviewResult]) -> List[Issue]:
-        """构建问题清单"""
+    def _build_geometry_issues(self, evidence: Dict) -> List[Dict]:
         issues = []
-        ss_counter = 0
-        uc_counter = 0
-        pl_counter = 0
-
-        for result in failed_rules:
-            rule_id = result.rule_id
-
-            if rule_id.startswith("SS-"):
-                # 尖钢问题
-                for item_id in result.affected_items:
-                    ss = self._find_sharp_steel(data, item_id)
-                    if ss:
-                        ss_counter += 1
-                        issues.append(Issue(
-                            issue_id="ISS-{:03d}".format(ss_counter),
-                            title="分型面尖钢 — {}".format(ss.get("position", "未知位置")),
-                            severity=result.severity,
-                            rule_ids=[rule_id],
-                            position=ss.get("position", ""),
-                            coordinates=ss.get("coordinate_approx", {}),
-                            current_values={
-                                "thickness_mm": ss.get("thickness_mm"),
-                                "height_mm": ss.get("height_mm"),
-                                "aspect_ratio": ss.get("aspect_ratio"),
-                                "edge_radius_mm": ss.get("edge_radius_mm")
-                            },
-                            required_values={
-                                "thickness_mm": "≥ 2.0",
-                                "aspect_ratio": "≤ 3.0",
-                                "edge_radius_mm": "≥ 0.5"
-                            },
-                            category="sharp_steel"
-                        ))
-
-            elif rule_id.startswith("PL-"):
-                # 分型面问题
-                pl_counter += 1
-                pl = data.get("parting_line", {})
-                issues.append(Issue(
-                    issue_id="ISS-PL-{:03d}".format(pl_counter),
-                    title="分型面问题 — {}".format(result.rule_name),
-                    severity=result.severity,
-                    rule_ids=[rule_id],
-                    position="分型面",
-                    coordinates={"y": pl.get("coordinate_y_mm", 0)},
-                    current_values={
-                        "flatness_score": pl.get("flatness_score"),
-                        "is_at_max_contour": pl.get("is_at_max_contour")
+        for risk in evidence.get("sharp_steels", []):
+            classification = risk.get("classification")
+            if classification not in ("confirmed_geometry_risk", "candidate"):
+                continue
+            severity = "ERROR" if classification == "confirmed_geometry_risk" else "WARN"
+            coordinate = risk["coordinate_approx"]
+            issue_id = "ISS-" + risk["fingerprint"].upper()
+            assessment = (
+                "确定性算法已确认微小边、可测夹角、窄非平面面且贴近产品，必须修改或提供反证。"
+                if severity == "ERROR"
+                else "确定性算法命中候选门槛；当前没有钢料实体，需工程师确认该处是否形成真实尖钢。"
+            )
+            issues.append(
+                {
+                    "issue_id": issue_id,
+                    "fingerprint": risk["fingerprint"],
+                    "severity": severity,
+                    "classification": classification,
+                    "title": "分型面局部尖钢几何风险",
+                    "coordinate_approx": copy.deepcopy(coordinate),
+                    "measurements": {
+                        "representative_edge_length_mm": risk[
+                            "representative_edge_length_mm"
+                        ],
+                        "wedge_angle_deg": risk["wedge_angle_deg"],
+                        "min_narrow_face_dimension_mm": risk[
+                            "min_narrow_face_dimension_mm"
+                        ],
+                        "distance_to_product_mm": risk.get("distance_to_product_mm"),
+                        "thickness_mm": risk.get("thickness_mm"),
+                        "height_mm": risk.get("height_mm"),
+                        "aspect_ratio": risk.get("aspect_ratio"),
+                        "true_edge_radius_mm": risk.get("edge_radius_mm"),
+                        "curve_min_radius_mm": risk.get("curve_min_radius_mm"),
                     },
-                    required_values={
-                        "flatness_score": "≥ 8",
-                        "is_at_max_contour": True
-                    },
-                    category="parting_line"
-                ))
-
-            elif rule_id.startswith("UC-"):
-                # 倒扣问题
-                for uc in data.get("undercuts", []):
-                    uc_counter += 1
-                    issues.append(Issue(
-                        issue_id="ISS-UC-{:03d}".format(uc_counter),
-                        title="倒扣 — {}".format(uc.get("position", "未知位置")),
-                        severity=result.severity,
-                        rule_ids=[rule_id],
-                        position=uc.get("position", ""),
-                        coordinates={},
-                        current_values={
-                            "depth_mm": uc.get("depth_mm"),
-                            "direction": uc.get("direction"),
-                            "requires_slider": uc.get("requires_slider")
-                        },
-                        required_values={
-                            "undercuts": "清空所有倒扣"
-                        },
-                        category="undercut"
-                    ))
-
-        # 按严重程度排序（ERROR 在前）
-        issues.sort(key=lambda i: (0 if i.severity == "ERROR" else 1, i.issue_id))
+                    "geometry_evidence": copy.deepcopy(risk.get("evidence", {})),
+                    "engineering_assessment": assessment,
+                    "recommendations": self._recommendations(risk),
+                    "verification_criteria": self._verification_criteria(risk),
+                }
+            )
         return issues
 
-    def _generate_solutions(self, issues: List[Issue],
-                             data: Dict) -> List[Solution]:
-        """为每个问题生成方案A和方案B"""
-        solutions = []
-        pl = data.get("parting_line", {})
-        pl_y = pl.get("coordinate_y_mm", 0)
-        product = data.get("product", {})
+    def _recommendations(self, risk: Dict) -> List[Dict]:
+        coordinate = risk["coordinate_approx"]
+        location = "X={:.3f}, Y={:.3f}, Z={:.3f} mm".format(
+            coordinate["x"], coordinate["y"], coordinate["z"]
+        )
+        return [
+            {
+                "priority": "A",
+                "type": "parting_surface_local_rework",
+                "instruction": (
+                    "在 {} 周围优先重构或平顺分型面，消除微小边和狭窄碎面；"
+                    "修改量必须由相邻产品面与钢料实体重新量测后确定，禁止凭当前边长推算。"
+                ).format(location),
+                "parameters": {
+                    "inspection_radius_mm": self.policy.get("cluster_radius_mm", 2.0),
+                    "target_min_steel_thickness_mm": 2.0,
+                    "target_max_aspect_ratio": 3.0,
+                    "target_min_true_radius_mm": 0.5,
+                },
+            },
+            {
+                "priority": "B",
+                "type": "local_insert",
+                "instruction": (
+                    "若产品功能不允许移动分型面，在该坐标建立独立镶件；"
+                    "镶件外形、锁固和材料必须结合真实钢料实体、寿命和冷却重新设计。"
+                ),
+                "parameters": {
+                    "target_min_insert_ligament_mm": 2.5,
+                    "target_min_true_radius_mm": 0.5,
+                    "fit_and_material": "需模具工程师按寿命与加工能力确认",
+                },
+            },
+        ]
 
-        for issue in issues:
-            sol_id = 0
+    def _verification_criteria(self, risk: Dict) -> List[str]:
+        criteria = [
+            "复跑后该坐标 {} mm 聚类范围内不再出现 confirmed_geometry_risk".format(
+                self.policy.get("cluster_radius_mm", 2.0)
+            ),
+            "有型腔/型芯钢料实体时，真实最小钢厚 ≥ 2.0 mm",
+            "真实钢料高度/厚度 ≤ 3.0",
+            "真实应力集中圆角 ≥ 0.5 mm",
+        ]
+        if risk.get("classification") == "candidate":
+            criteria.insert(0, "人工确认该局部是否构成承压尖钢，并记录依据")
+        return criteria
 
-            if issue.category == "sharp_steel":
-                # 方案A：调整分型面
-                thickness = issue.current_values.get("thickness_mm", 1.0)
-                height = issue.current_values.get("height_mm", 1.0)
-                target_y = pl_y + (2.0 - thickness) * 2.0 if thickness < 2.0 else pl_y
-                new_thickness = thickness + abs(target_y - pl_y) * 0.5
+    def _track_changes(
+        self,
+        current_issues: List[Dict],
+        previous_review: Optional[Dict],
+        current_source_hash: str,
+    ) -> Tuple[List[Dict], Dict]:
+        if not previous_review:
+            identifiers = [item["issue_id"] for item in current_issues]
+            return current_issues, {
+                "same_source_hash": False,
+                "new_issue_ids": identifiers,
+                "improved_issue_ids": [],
+                "remaining_issue_ids": identifiers,
+                "closed_issue_ids": [],
+                "regressed_issue_ids": [],
+                "comparisons": [],
+            }
 
-                sol_id += 1
-                solutions.append(Solution(
-                    solution_id="{}-A".format(issue.issue_id),
-                    issue_id=issue.issue_id,
-                    solution_type="A",
-                    priority="推荐",
-                    description="调整分型面位置 —— 零额外机构成本",
-                    parameters={
-                        "分型面上移距离_mm": round(target_y - pl_y, 1),
-                        "新分型面坐标_Y_mm": round(target_y, 1),
-                        "修改后钢料厚度_mm": round(new_thickness, 1),
-                        "修改后细长比": round(height / new_thickness, 1)
-                    },
-                    nx_operations=[
-                        "建模 → 曲面 → 有界平面，选择产品顶面最大轮廓线",
-                        "注塑模向导 → 分型 → 编辑分型面 → 替换为新建平面",
-                        "重新计算型腔/型芯区域"
-                    ],
-                    verification={
-                        "检查项": "该处 thickness_mm",
-                        "目标值": "≥ 2.0 mm"
-                    },
-                    cost_impact="零额外机构成本"
-                ))
+        previous_issues = previous_review.get("issues", [])
+        unmatched = set(range(len(current_issues)))
+        comparisons = []
+        new_ids = []
+        improved_ids = []
+        remaining_ids = []
+        closed_ids = []
+        regressed_ids = []
 
-                # 方案B：局部镶件
-                sol_id += 1
-                solutions.append(Solution(
-                    solution_id="{}-B".format(issue.issue_id),
-                    issue_id=issue.issue_id,
-                    solution_type="B",
-                    priority="备选",
-                    description="局部镶件 —— 当分型面不可移动时采用",
-                    parameters={
-                        "镶件材料": "H13 (HRC 48~52)",
-                        "配合间隙_mm": 0.015,
-                        "镶件边缘最小厚度_mm": 2.5
-                    },
-                    nx_operations=[
-                        "建模 → 拉伸，在尖钢区域绘制镶件轮廓",
-                        "布尔求差（从模仁减去）",
-                        "新建组件 → 添加镶件零件"
-                    ],
-                    verification={
-                        "检查项": "镶件边缘最小厚度",
-                        "目标值": "≥ 2.5 mm"
-                    },
-                    cost_impact="镶件加工费 + 装配工时"
-                ))
+        for previous in previous_issues:
+            match_index = _find_issue_match(previous, current_issues, unmatched)
+            if match_index is None:
+                closed_ids.append(previous["issue_id"])
+                comparisons.append(
+                    {
+                        "issue_id": previous["issue_id"],
+                        "previous": previous.get("severity"),
+                        "current": "CLOSED",
+                        "change": "closed",
+                    }
+                )
+                continue
+            unmatched.remove(match_index)
+            current = current_issues[match_index]
+            current["issue_id"] = previous["issue_id"]
+            current_rank = _severity_rank(current.get("severity"))
+            previous_rank = _severity_rank(previous.get("severity"))
+            if current_rank < previous_rank:
+                change = "improved"
+                improved_ids.append(current["issue_id"])
+            elif current_rank > previous_rank:
+                change = "regressed"
+                regressed_ids.append(current["issue_id"])
+            else:
+                change = "remaining"
+            remaining_ids.append(current["issue_id"])
+            comparisons.append(
+                {
+                    "issue_id": current["issue_id"],
+                    "previous": previous.get("severity"),
+                    "current": current.get("severity"),
+                    "change": change,
+                    "coordinate_shift_mm": _coordinate_distance(
+                        previous.get("coordinate_approx"), current.get("coordinate_approx")
+                    ),
+                }
+            )
 
-            elif issue.category == "parting_line":
-                # 分型面问题方案
-                solutions.append(Solution(
-                    solution_id="{}-A".format(issue.issue_id),
-                    issue_id=issue.issue_id,
-                    solution_type="A",
-                    priority="推荐",
-                    description="重新评估分型面设计",
-                    parameters={
-                        "建议分型面平直度": "≥ 8/10",
-                        "分型面应位于": "产品最大轮廓处"
-                    },
-                    nx_operations=[
-                        "注塑模向导 → 分型 → 自动分型面",
-                        "手动调整分型线至最大轮廓",
-                        "重建分型面并验证"
-                    ],
-                    verification={
-                        "检查项": "parting_line.flatness_score / is_at_max_contour",
-                        "目标值": "≥ 8 / true"
-                    },
-                    cost_impact="设计阶段调整，成本可忽略"
-                ))
+        for index in sorted(unmatched):
+            issue = current_issues[index]
+            new_ids.append(issue["issue_id"])
+            remaining_ids.append(issue["issue_id"])
+            comparisons.append(
+                {
+                    "issue_id": issue["issue_id"],
+                    "previous": None,
+                    "current": issue.get("severity"),
+                    "change": "new",
+                }
+            )
 
-            elif issue.category == "undercut":
-                # 倒扣问题方案
-                depth = issue.current_values.get("depth_mm", 1.0)
-                direction = issue.current_values.get("direction", "horizontal")
+        previous_hash = previous_review.get("source", {}).get("source_sha256")
+        same_hash = previous_hash == current_source_hash
+        return current_issues, {
+            "same_source_hash": same_hash,
+            "new_issue_ids": new_ids,
+            "improved_issue_ids": improved_ids,
+            "remaining_issue_ids": remaining_ids,
+            "closed_issue_ids": closed_ids,
+            "regressed_issue_ids": regressed_ids,
+            "comparisons": comparisons,
+        }
 
-                solutions.append(Solution(
-                    solution_id="{}-A".format(issue.issue_id),
-                    issue_id=issue.issue_id,
-                    solution_type="A",
-                    priority="推荐",
-                    description="添加滑块/斜顶机构解除倒扣",
-                    parameters={
-                        "倒扣深度_mm": depth,
-                        "倒扣方向": direction,
-                        "滑块行程_mm": round(depth + 3, 1),
-                        "滑块角度_deg": 12
-                    },
-                    nx_operations=[
-                        "注塑模向导 → 滑块/斜顶库",
-                        "选择对应方向的标准滑块",
-                        "调整滑块行程和角度参数"
-                    ],
-                    verification={
-                        "检查项": "undercuts 数组",
-                        "目标值": "应为空"
-                    },
-                    cost_impact="模具成本 +15~25%"
-                ))
+    def _build_counts(self, rule_results: List[Dict], issues: List[Dict]) -> Dict:
+        return {
+            "rule_error": sum(1 for item in rule_results if item["status"] == "ERROR"),
+            "rule_warn": sum(1 for item in rule_results if item["status"] == "WARN"),
+            "rule_unavailable": sum(
+                1 for item in rule_results if item["status"] == "UNAVAILABLE"
+            ),
+            "issue_error": sum(1 for item in issues if item["severity"] == "ERROR"),
+            "issue_warn": sum(1 for item in issues if item["severity"] == "WARN"),
+        }
 
-        return solutions
+    def _determine_status(self, counts: Dict) -> str:
+        if counts["issue_error"] or counts["rule_error"]:
+            return "not_passed"
+        if counts["issue_warn"] or counts["rule_warn"] or counts["rule_unavailable"]:
+            return "conditional"
+        return "passed"
 
-    def _find_sharp_steel(self, data: Dict, ss_id: str) -> Optional[Dict]:
-        """根据 ID 查找尖钢数据"""
-        for ss in data.get("sharp_steels", []):
-            if ss.get("id") == ss_id:
-                return ss
+    def _build_repair_plan(self, issues: List[Dict]) -> Dict:
+        return {
+            "status": "manual_or_licensed_nx_modifier_required" if issues else "not_required",
+            "source_file_must_remain_unchanged": True,
+            "may_prepare_working_copy": bool(issues),
+            "may_label_output_as_modified": False,
+            "reason": (
+                "当前工作流只生成量测证据和修改计划；合法 NX Headless 修改成功并复审后，"
+                "才可交付修改版 .prt。"
+                if issues
+                else "未生成修改任务。"
+            ),
+            "operations": [
+                {
+                    "issue_id": issue["issue_id"],
+                    "coordinate_approx": issue["coordinate_approx"],
+                    "preferred_action": issue["recommendations"][0],
+                    "fallback_action": issue["recommendations"][1],
+                }
+                for issue in issues
+            ],
+        }
+
+    def _build_next_action(self, status: str, round_number: int, max_rounds: int) -> Dict:
+        if status == "passed":
+            return {"action": "finish", "message": "审查闭环，可输出最终报告。"}
+        if status == "stopped_incomplete":
+            return {
+                "action": "human_review",
+                "message": "已达到最大轮次，停止自动 Loop，遗留项转人工模具评审。",
+            }
+        return {
+            "action": "modify_copy_and_recheck",
+            "message": (
+                "仅修改工作副本；完成后把新 .prt 作为同一 Session 的下一轮输入，"
+                "工作流会自动匹配、关闭或升级问题。"
+            ),
+        }
+
+    def _rule(self, rule_id: str, fallback_name: str) -> Dict:
+        rule = copy.deepcopy(self.rules.get(rule_id, {}))
+        rule.setdefault("id", rule_id)
+        rule.setdefault("name", fallback_name)
+        return rule
+
+    @staticmethod
+    def _result(rule: Dict, status: str, evidence: str, message: str) -> Dict:
+        return {
+            "rule_id": rule["id"],
+            "name": rule["name"],
+            "status": status,
+            "configured_severity": rule.get("severity"),
+            "evidence": evidence,
+            "message": message,
+            "consequence": rule.get("consequence"),
+        }
+
+
+def _compare(value: float, operator: str, threshold: float) -> bool:
+    if operator == ">=":
+        return value >= threshold
+    if operator == "<=":
+        return value <= threshold
+    if operator == "==":
+        return value == threshold
+    raise ReviewEngineError("不支持的规则操作符: " + str(operator))
+
+
+def _worst(values: Iterable[float], operator: str) -> float:
+    return min(values) if operator == ">=" else max(values)
+
+
+def _find_issue_match(
+    previous: Dict, current_issues: List[Dict], unmatched: set
+) -> Optional[int]:
+    previous_fingerprint = previous.get("fingerprint")
+    for index in unmatched:
+        if previous_fingerprint and current_issues[index].get("fingerprint") == previous_fingerprint:
+            return index
+    previous_coordinate = previous.get("coordinate_approx")
+    nearest_index = None
+    nearest_distance = math.inf
+    for index in unmatched:
+        distance = _coordinate_distance(
+            previous_coordinate, current_issues[index].get("coordinate_approx")
+        )
+        if distance is not None and distance <= 3.0 and distance < nearest_distance:
+            nearest_index = index
+            nearest_distance = distance
+    return nearest_index
+
+
+def _coordinate_distance(first: Optional[Dict], second: Optional[Dict]) -> Optional[float]:
+    if not first or not second:
         return None
-
-    # ========================================================================
-    # Step 4: 追踪器辅助方法
-    # ========================================================================
-
-    def _find_closed(self, previous_data: Optional[Dict],
-                      current_data: Dict, issues: List[Issue]) -> List[str]:
-        """找出哪些问题上轮有、本轮已修复"""
-        if not previous_data:
-            return []
-
-        closed = []
-        current_issue_ids = {i.issue_id for i in issues}
-
-        # 检查上一轮的尖钢是否已消除
-        prev_ss_ids = {s["id"] for s in previous_data.get("sharp_steels", [])}
-        curr_ss_ids = {s["id"] for s in current_data.get("sharp_steels", [])}
-
-        for prev_id in prev_ss_ids - curr_ss_ids:
-            closed.append("ISS-{}".format(prev_id.replace("SS-", "")))
-
-        return closed
-
-    def _build_pending_actions(self, issues: List[Issue],
-                                solutions: List[Solution]) -> List[str]:
-        """构建用户待执行动作列表"""
-        actions = []
-
-        for issue in issues:
-            sol_a = next((s for s in solutions
-                         if s.issue_id == issue.issue_id and s.solution_type == "A"), None)
-            if sol_a:
-                if issue.category == "sharp_steel":
-                    dy = sol_a.parameters.get("分型面上移距离_mm", 0)
-                    if dy != 0:
-                        actions.append(
-                            "{} → 方案A：移动分型面 ({:.1f}mm) [{}]".format(
-                                issue.issue_id, dy, issue.title
-                            )
-                        )
-                elif issue.category == "undercut":
-                    actions.append(
-                        "{} → 方案A：添加滑块机构 [{}]".format(
-                            issue.issue_id, issue.title
-                        )
-                    )
-                else:
-                    actions.append(
-                        "{} → 方案A：{} [{}]".format(
-                            issue.issue_id, sol_a.description, issue.title
-                        )
-                    )
-
-        actions.append("修改完成后重新运行 NX Journal 脚本")
-        actions.append("将新 JSON 贴回继续审查")
-        return actions
-
-    # ========================================================================
-    # 最终报告
-    # ========================================================================
-
-    def generate_final_report(self, history: List[Dict]) -> str:
-        """生成最终审查报告"""
-        if not history:
-            return "无审查历史数据"
-
-        last = history[-1]
-        tracker = last.get("tracker", {})
-        total_rounds = len(history)
-
-        # 汇总所有轮次的问题
-        all_errors = 0
-        all_warns = 0
-        all_issues = []
-
-        for h in history:
-            all_errors += h.get("tracker", {}).get("errors_this_round", 0)
-            all_warns += h.get("tracker", {}).get("warns_this_round", 0)
-            for issue in h.get("issues", []):
-                all_issues.append(issue)
-
-        closed_issues = tracker.get("closed_issues", [])
-        remaining = tracker.get("remaining_issues", [])
-
-        report = []
-        report.append("=" * 60)
-        report.append("      分型面尖钢审查最终报告")
-        report.append("      Review ID: REV-{}-{}".format(
-            datetime.now().strftime("%Y%m%d"), total_rounds
-        ))
-        report.append("=" * 60)
-        report.append("")
-        report.append("一、审查统计")
-        report.append("   • 总轮次：{} 轮".format(total_rounds))
-        report.append("   • 累计发现问题：{} 个 ERROR，{} 个 WARN".format(all_errors, all_warns))
-        report.append("   • 成功关闭：{} 个".format(len(closed_issues)))
-        report.append("   • 遗留问题：{} 个".format(len(remaining)))
-        report.append("")
-
-        # 状态评级
-        status = tracker.get("overall_status", "未知")
-        report.append("三、最终设计状态评级")
-        if status == "通过":
-            report.append("   • [✓] 通过（ERROR=0, WARN≤1）")
-        elif len(remaining) > 0 and all(e.get("severity") != "ERROR" or e.get("issue_id") not in remaining for e in all_issues if e.get("issue_id") in remaining):
-            report.append("   • [✓] 有条件通过（遗留WARN，需人工确认）")
-        else:
-            report.append("   • [✗] 不通过（遗留ERROR，不建议开模）")
-        report.append("")
-
-        # 遗留风险
-        if remaining:
-            report.append("四、遗留风险说明")
-            for issue in all_issues:
-                if issue.get("issue_id") in remaining:
-                    report.append("   • {} [{}] {}: {}".format(
-                        issue.get("issue_id", ""),
-                        issue.get("severity", ""),
-                        issue.get("title", ""),
-                        issue.get("current_values", {})
-                    ))
-            report.append("")
-
-        report.append("=" * 60)
-        return "\n".join(report)
+    return math.sqrt(sum((first[axis] - second[axis]) ** 2 for axis in ("x", "y", "z")))
 
 
-# ============================================================================
-# CLI 入口
-# ============================================================================
+def _severity_rank(severity: Optional[str]) -> int:
+    return {"ERROR": 2, "WARN": 1}.get(severity or "", 0)
 
-def main_cli():
-    """命令行入口：python review_engine.py <input.json>"""
-    if len(sys.argv) < 2:
-        print("用法: python review_engine.py <input.json>")
-        print("      python review_engine.py <input.json> <previous.json>")
-        sys.exit(1)
 
-    input_path = sys.argv[1]
-    previous_path = sys.argv[2] if len(sys.argv) > 2 else None
+def _number(value: Optional[float], digits: int) -> str:
+    if value is None:
+        return "unavailable"
+    return ("{0:." + str(digits) + "f}").format(value)
 
-    with open(input_path, 'r', encoding='utf-8-sig') as f:
-        data = json.load(f)
 
-    previous_data = None
-    if previous_path:
-        with open(previous_path, 'r', encoding='utf-8-sig') as f:
-            previous_data = json.load(f)
+def _markdown_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
+
+def _join_ids(values: List[str]) -> str:
+    return ", ".join(values) if values else "无"
+
+
+def load_json(path: Path) -> Dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        raise ReviewEngineError("无法读取 JSON {}: {}".format(path, error))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="从确定性几何证据生成尖钢审查结果")
+    parser.add_argument("evidence", type=Path)
+    parser.add_argument("--previous", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--markdown", type=Path)
+    parser.add_argument("--round", type=int, default=1)
+    parser.add_argument("--max-rounds", type=int, default=5)
+    args = parser.parse_args()
+
+    evidence = load_json(args.evidence)
+    previous = load_json(args.previous) if args.previous else None
     engine = ReviewEngine()
-    result = engine.review(data, previous_data)
-
-    # 输出
-    output = {
-        "input_file": input_path,
-        "review_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        **result
-    }
-
-    out_path = input_path.replace(".json", "_reviewed.json")
-    with open(out_path, 'w', encoding='utf-8-sig') as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
-
-    print("Review done! Saved to: {}".format(out_path))
-    print("Overall: " + ("PASS" if result["is_pass"] else "FAIL"))
-
-    return output
+    result = engine.review(
+        evidence,
+        previous_review=previous,
+        round_number=args.round,
+        max_rounds=args.max_rounds,
+    )
+    output_path = args.output or args.evidence.with_name("review_result.json")
+    markdown_path = args.markdown or output_path.with_suffix(".md")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    markdown_path.write_text(engine.render_markdown(result), encoding="utf-8")
+    print("review_json=" + str(output_path.resolve()))
+    print("review_markdown=" + str(markdown_path.resolve()))
+    print("status=" + result["status"])
+    return 1 if result["status"] in ("not_passed", "stopped_incomplete") else 0
 
 
 if __name__ == "__main__":
-    main_cli()
+    raise SystemExit(main())

@@ -1,67 +1,86 @@
-﻿{
+{
+  "schema_version": "2.0",
+  "sharp_steel_candidate_policy": {
+    "near_product_max_mm": 0.1,
+    "valid_curve_radius_max_mm": 1000000.0,
+    "narrow_nonplanar_face_max_mm": 1.0,
+    "confirmed_max_edge_length_mm": 0.1,
+    "confirmed_min_angle_deg": 1.0,
+    "confirmed_max_angle_deg": 45.0,
+    "candidate_max_edge_length_mm": 1.5,
+    "candidate_min_angle_deg": 0.5,
+    "candidate_max_angle_deg": 15.0,
+    "cluster_radius_mm": 2.0,
+    "max_reported_candidates": 30
+  },
   "rules": [
     {
       "id": "PL-001",
-      "name": "分型面平直度",
-      "description": "分型面应为平面；复杂曲面需有充分理由",
-      "field": "parting_line.flatness_score",
-      "operator": ">=",
-      "threshold": 8,
+      "name": "分型面复杂度",
+      "description": "平面分型优先；复杂曲面必须结合产品结构说明必要性",
       "severity": "WARN",
-      "consequence": "加工困难，配模精度差",
+      "consequence": "加工、配模和维护成本上升",
       "category": "parting_line"
     },
     {
       "id": "PL-002",
-      "name": "分型面位置",
-      "description": "分型面必须位于产品最大轮廓处",
+      "name": "最大轮廓分型位置",
+      "description": "需结合开模方向验证分型位置是否位于最大可见轮廓",
       "field": "parting_line.is_at_max_contour",
       "operator": "==",
       "threshold": true,
       "severity": "ERROR",
-      "consequence": "产生倒扣，拉伤产品，或形成尖钢",
+      "consequence": "可能形成倒扣、拉伤或尖钢",
       "category": "parting_line"
     },
     {
+      "id": "SS-GEO-001",
+      "name": "尖钢确定性几何候选",
+      "description": "同时满足贴近产品、短边/微边、可测夹角和窄非平面面时标记风险",
+      "severity": "ERROR",
+      "consequence": "可能形成承压尖钢、碎面或局部薄弱钢料",
+      "category": "sharp_steel_geometry"
+    },
+    {
       "id": "SS-001",
-      "name": "尖钢最小壁厚",
-      "description": "分型面边缘钢料最小壁厚须 >= 2.0mm",
+      "name": "尖钢最小钢厚",
+      "description": "真实钢料最小厚度须不小于 2.0 mm",
       "field": "sharp_steels[*].thickness_mm",
       "operator": ">=",
       "threshold": 2.0,
       "severity": "ERROR",
-      "consequence": "崩裂，模具寿命急剧下降",
+      "consequence": "崩裂或模具寿命下降",
       "category": "sharp_steel",
       "per_item": true
     },
     {
       "id": "SS-002",
       "name": "钢料细长比",
-      "description": "钢料高度/厚度比须 <= 3:1",
+      "description": "真实钢料高度/厚度比须不大于 3.0",
       "field": "sharp_steels[*].aspect_ratio",
       "operator": "<=",
       "threshold": 3.0,
       "severity": "ERROR",
-      "consequence": "强度不足，受压变形",
+      "consequence": "强度不足或受压变形",
       "category": "sharp_steel",
       "per_item": true
     },
     {
       "id": "SS-003",
-      "name": "尖钢边缘R角",
-      "description": "不得有尖锐内角（R < 0.5mm）",
+      "name": "真实钢料圆角",
+      "description": "应力集中处真实钢料圆角须不小于 0.5 mm",
       "field": "sharp_steels[*].edge_radius_mm",
       "operator": ">=",
       "threshold": 0.5,
       "severity": "WARN",
-      "consequence": "应力集中，易崩缺",
+      "consequence": "应力集中或崩缺",
       "category": "sharp_steel",
       "per_item": true
     },
     {
       "id": "UC-001",
       "name": "倒扣检测",
-      "description": "分型面下方不得有倒扣阻碍开模",
+      "description": "需基于开模方向验证产品可见性与倒扣",
       "field": "undercuts",
       "operator": "length_zero",
       "threshold": 0,
@@ -70,46 +89,21 @@
       "category": "undercut"
     }
   ],
-  "material_wear_factors": {
-    "ABS": 1.0,
-    "PC": 1.2,
-    "POM": 1.5,
-    "PA": 2.0,
-    "PA+GF": 3.5,
-    "PA6+GF30": 3.5,
-    "PA66+GF30": 4.0,
-    "PP": 1.0,
-    "PP+GF": 3.0,
-    "PP+GF30": 3.5,
-    "PBT+GF30": 3.5,
-    "PPS+GF40": 5.0,
-    "PEEK+GF30": 4.0,
-    "PEI": 2.0,
-    "PMMA": 1.0,
-    "LCP": 1.5,
-    "DEFAULT": 1.0
-  },
   "solution_priority": [
     {
       "rank": 1,
-      "name": "移分型面",
-      "description": "调整分型面位置到更合理的高度",
-      "cost_impact": "零额外机构成本",
-      "applicable_when": "产品允许分型面移动"
+      "name": "局部分型面重构",
+      "description": "优先消除微小边、狭窄碎面和不连续过渡"
     },
     {
       "rank": 2,
-      "name": "局部避空+镶件",
-      "description": "在尖钢区域挖镶件槽，制作独立镶件",
-      "cost_impact": "镶件加工费 + 装配工时",
-      "applicable_when": "分型面不可移动"
+      "name": "局部镶件",
+      "description": "分型面不可调整时，把薄弱区域设计为可更换镶件"
     },
     {
       "rank": 3,
-      "name": "加侧抽芯",
-      "description": "添加侧向抽芯机构（滑块/斜顶）",
-      "cost_impact": "模具整体成本 ↑20~35%",
-      "applicable_when": "产品几何复杂，前两者不适用"
+      "name": "侧向机构",
+      "description": "产品结构导致直接分型不可行时再评估滑块或斜顶"
     }
   ]
 }

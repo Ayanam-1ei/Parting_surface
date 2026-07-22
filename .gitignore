@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.test-output/
+review-output/
+.work/
+*.tmp
