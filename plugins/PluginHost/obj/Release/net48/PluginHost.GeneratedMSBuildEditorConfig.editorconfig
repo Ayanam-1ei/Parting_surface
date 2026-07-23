@@ -1,0 +1,5 @@
+is_global = true
+build_property.RootNamespace = PartingSurface.PluginHost
+build_property.ProjectDir = S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 

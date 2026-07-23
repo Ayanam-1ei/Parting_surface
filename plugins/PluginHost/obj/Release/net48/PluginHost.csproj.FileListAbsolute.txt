@@ -1,0 +1,16 @@
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.PluginHost.exe.config
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.PluginHost.exe
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.PluginHost.pdb
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.Detection.dll
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.Repair.dll
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.Detection.pdb
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\bin\Release\net48\PartingSurface.Repair.pdb
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.csproj.AssemblyReference.cache
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.GeneratedMSBuildEditorConfig.editorconfig
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.AssemblyInfoInputs.cache
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.AssemblyInfo.cs
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.csproj.CoreCompileInputs.cache
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.sourcelink.json
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PluginHost.csproj.Up2Date
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PartingSurface.PluginHost.exe
+S:\visiable\coaicad\_Source\Parting_surface\plugins\PluginHost\obj\Release\net48\PartingSurface.PluginHost.pdb

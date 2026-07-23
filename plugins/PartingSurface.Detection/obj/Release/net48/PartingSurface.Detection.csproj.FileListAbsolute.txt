@@ -1,0 +1,10 @@
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.csproj.AssemblyReference.cache
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.GeneratedMSBuildEditorConfig.editorconfig
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.AssemblyInfoInputs.cache
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.AssemblyInfo.cs
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.csproj.CoreCompileInputs.cache
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.sourcelink.json
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\bin\Release\net48\PartingSurface.Detection.dll
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\bin\Release\net48\PartingSurface.Detection.pdb
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.dll
+s:\visiable\coaicad\_Source\Parting_surface\plugins\PartingSurface.Detection\obj\Release\net48\PartingSurface.Detection.pdb

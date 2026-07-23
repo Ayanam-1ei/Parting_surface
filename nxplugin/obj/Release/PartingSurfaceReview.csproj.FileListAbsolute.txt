@@ -1,0 +1,2 @@
+S:\visiable\coaicad\_Source\Parting_surface\nxplugin\obj\Release\PartingSurfaceReview.csproj.AssemblyReference.cache
+S:\visiable\coaicad\_Source\Parting_surface\nxplugin\obj\Release\PartingSurfaceReview.csproj.CoreCompileInputs.cache

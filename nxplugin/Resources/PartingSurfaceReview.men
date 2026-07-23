@@ -1,0 +1,27 @@
+!
+! 分型面尖钢审查 菜单
+!
+VERSION 120
+
+MENU PartingSurfaceReview
+  BEFORE UG_HELP
+  CASCADE_BUTTON PARTING_SURFACE_MENU
+  LABEL 分型面审查(&P)
+  SEPARATOR
+END_OF_MENU
+
+MENU PARTING_SURFACE_MENU
+  BUTTON REVIEW_PARTING_SURFACE
+  LABEL 审查分型面(&R)...
+  ACTIONS PartingSurfaceReview.dll
+  SEPARATOR
+  
+  BUTTON BATCH_REVIEW
+  LABEL 批量审查(&B)...
+  ACTIONS PartingSurfaceReview.dll
+  SEPARATOR
+  
+  BUTTON EXPORT_REPORT
+  LABEL 导出报告(&E)...
+  ACTIONS PartingSurfaceReview.dll
+END_OF_MENU

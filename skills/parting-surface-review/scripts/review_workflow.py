@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
@@ -29,6 +29,8 @@ def run_review_workflow(
     max_rounds: int = 5,
     keep_work: bool = False,
     prepare_copy: bool = False,
+    auto_repair: bool = False,
+    repair_dll: Optional[Path] = None,
 ) -> Dict:
     source_path = source_path.resolve()
     session_directory = session_directory.resolve()
@@ -134,7 +136,7 @@ def run_review_workflow(
     )
     _write_json_atomic(session_path, session)
 
-    return {
+    result = {
         "session_path": str(session_path),
         "round_directory": str(round_directory),
         "evidence_path": str(round_directory / "geometry_evidence.json"),
@@ -147,6 +149,57 @@ def run_review_workflow(
         "source_sha256_after": source_hash_after,
         "source_unchanged": source_hash_before == source_hash_after,
     }
+
+    # ── Auto-repair integration ─────────────────────────
+    if auto_repair and repair_dll and review["status"] == "not_passed":
+        if round_number >= max_rounds:
+            result["auto_repair"] = {"status": "skipped", "reason": "已达最大轮次"}
+        else:
+            try:
+                from repair_commander import RepairCommander
+
+                commander = RepairCommander(nx_root=nx_root)
+                repair_result = commander.auto_repair(
+                    session_directory=session_directory,
+                    dll_path=repair_dll,
+                    source_path=source_path,
+                    round_number=round_number,
+                )
+
+                result["auto_repair"] = {
+                    "status": repair_result["repair_log"]["status"],
+                    "working_prt": repair_result["working_prt"],
+                    "repair_log_path": str(
+                        round_directory / "repair_log.json"
+                    ),
+                }
+
+                # Recurse: re-review the modified working copy
+                if repair_result["repair_log"]["status"] in ("completed", "partial"):
+                    modified_prt = Path(repair_result["working_prt"])
+                    if modified_prt.is_file() and sha256_file(modified_prt) != source_hash_before:
+                        next_result = run_review_workflow(
+                            source_path=modified_prt,
+                            session_directory=session_directory,
+                            nx_root=nx_root,
+                            csc=csc,
+                            max_rounds=max_rounds,
+                            keep_work=keep_work,
+                            prepare_copy=prepare_copy,
+                            auto_repair=auto_repair,
+                            repair_dll=repair_dll,
+                        )
+                        result["next_round"] = next_result
+            except ImportError:
+                result["auto_repair"] = {
+                    "status": "skipped", "reason": "repair_commander 模块不可用"
+                }
+            except Exception as exc:
+                result["auto_repair"] = {
+                    "status": "failed", "error": str(exc)
+                }
+
+    return result
 
 
 def _load_session(path: Path) -> Dict:
@@ -200,11 +253,20 @@ def main() -> int:
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--prepare-working-copy", action="store_true")
+    parser.add_argument("--auto-repair", action="store_true",
+                        help="审查不通过时自动调用修复 DLL 修改几何")
+    parser.add_argument("--repair-dll", type=Path,
+                        help="PartingSurfaceRepair.dll 路径")
     args = parser.parse_args()
 
     session_directory = args.session
     if session_directory is None:
         session_directory = Path.cwd() / "review-output" / args.source.stem
+
+    if args.auto_repair and not args.repair_dll:
+        print("ERROR: --auto-repair 需要 --repair-dll 参数", file=sys.stderr)
+        return 2
+
     try:
         result = run_review_workflow(
             source_path=args.source,
@@ -214,6 +276,8 @@ def main() -> int:
             max_rounds=args.max_rounds,
             keep_work=args.keep_work,
             prepare_copy=args.prepare_working_copy,
+            auto_repair=args.auto_repair,
+            repair_dll=args.repair_dll,
         )
     except (
         GeometryPipelineError,
@@ -227,7 +291,11 @@ def main() -> int:
 
     for key, value in result.items():
         if value is not None:
-            print("{}={}".format(key, value))
+            # For nested dicts, flatten with prefix
+            if isinstance(value, dict):
+                print("{}={}".format(key, json.dumps(value, ensure_ascii=False)))
+            else:
+                print("{}={}".format(key, value))
     return 0
 
 

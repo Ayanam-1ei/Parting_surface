@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>9.0</LangVersion>
+    <AssemblyName>PartingSurface.Repair</AssemblyName>
+    <RootNamespace>PartingSurface.Repair</RootNamespace>
+    <OutputType>Library</OutputType>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PartingSurface.Detection\PartingSurface.Detection.csproj" />
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+
+</Project>
